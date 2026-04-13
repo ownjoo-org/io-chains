@@ -52,6 +52,18 @@ class Collector(Subscriber):
             raise StopAsyncIteration
         return item
 
+    def close(self) -> None:
+        """Drain and discard all buffered items.
+
+        Call after the pipeline has completed to free memory held by unconsumed
+        output.  Items already yielded by iteration are unaffected.
+        """
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except QueueEmpty:
+                break
+
     def __iter__(self):
         """Drain buffered items synchronously. Only use after the pipeline has completed."""
         while True:

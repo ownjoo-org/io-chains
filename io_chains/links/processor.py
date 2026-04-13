@@ -138,6 +138,12 @@ class Processor(Link):
                 break
             await self._process_and_publish(datum)
 
+    def close(self) -> None:
+        """Release input and subscriber references after the pipeline has completed."""
+        super().close()  # Link.close() — drains queue + clears _subscribers
+        self._input = None
+        self._processor = None
+
     async def run(self) -> None:
         self._active_workers = self._workers
         self._eos_received = 0

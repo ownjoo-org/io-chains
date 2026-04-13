@@ -58,6 +58,14 @@ class Publisher:
                 subscriber._register_upstream()
         self._subscribers.append(subscriber)
 
+    def close(self) -> None:
+        """Release subscriber references.
+
+        Call once the pipeline has completed to allow downstream links to be
+        garbage-collected.  Safe to call multiple times.
+        """
+        self._subscribers.clear()
+
     async def publish(self, datum: Any) -> None:
         if not self._subscribers:
             return

@@ -91,5 +91,13 @@ class Chain(Linkable):
                 raise eg.exceptions[0]
             raise
 
+    def close(self) -> None:
+        """Close all internal links and release references."""
+        for link in self._links:
+            if hasattr(link, "close"):
+                link.close()
+        self._links.clear()
+        super().close()  # Publisher.close() — clears Chain's own _subscribers
+
     async def __call__(self) -> None:
         await self.run()

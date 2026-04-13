@@ -110,6 +110,21 @@ class Link(Linkable):
             if hasattr(result, "__await__"):
                 await result
 
+    def close(self) -> None:
+        """Drain the internal queue and release subscriber references.
+
+        Call once the pipeline has completed.  The queue should already be
+        empty after a normal run; this is a safety drain for cancelled or
+        failed pipelines where items may remain.
+        """
+        super().close()  # Publisher.close() — clears _subscribers
+        q = self._queue
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except Exception:  # noqa: BLE001
+                break
+
     @abstractmethod
     async def run(self) -> None:
         pass
