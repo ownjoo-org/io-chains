@@ -2,7 +2,7 @@ from collections.abc import AsyncIterable, Callable, Iterable
 from inspect import isawaitable
 from typing import Any
 
-from oj_persistence.store.async_base import AsyncAbstractStore
+from oj_persistence.async_manager import AsyncPersistenceManager
 
 from io_chains._internal.link import Link
 from io_chains._internal.sentinel import END_OF_STREAM, EndOfStream
@@ -12,34 +12,40 @@ _OPERATIONS = {"upsert", "create", "update"}
 
 class PersistenceLink(Link):
     """
-    A mid-chain tap: writes each item to an async store as a side effect,
-    then passes the item through to downstream subscribers unchanged.
+    A mid-chain tap: writes each item to a named store (via AsyncPersistenceManager)
+    as a side effect, then passes the item through to downstream subscribers unchanged.
 
-    The store's async context manager is entered at the start of run() and
-    exited on completion, guaranteeing any buffered writes are flushed.
+    The manager's store_context() is entered at the start of run() and exited on
+    completion, guaranteeing any buffered writes (e.g. NDJSON) are flushed.
 
     Parameters
     ----------
-    store:      Any AsyncAbstractStore implementation.
-    key_fn:     Callable that extracts the store key (str) from each item.
-    operation:  'upsert' (default) | 'create' | 'update'
+    manager:          AsyncPersistenceManager instance (singleton, but injected for testability).
+    store_id:         Name under which the target store is registered in the manager.
+    key_fn:           Callable that extracts the store key (str) from each item.
+    operation:        'upsert' (default) | 'create' | 'update'
+    allow_inefficient: Passed through to manager.upsert(); ignored for create/update.
     """
 
     def __init__(
         self,
         *args,
-        store: AsyncAbstractStore,
+        manager: AsyncPersistenceManager,
+        store_id: str,
         key_fn: Callable[[Any], str],
         operation: str = "upsert",
+        allow_inefficient: bool = False,
         source: Callable | Iterable | None = None,
         **kwargs,
     ) -> None:
         if operation not in _OPERATIONS:
             raise ValueError(f"operation must be one of {_OPERATIONS}, got {operation!r}")
         super().__init__(*args, **kwargs)
-        self._store = store
+        self._manager = manager
+        self._store_id = store_id
         self._key_fn = key_fn
         self._operation = operation
+        self._allow_inefficient = allow_inefficient
         self._input: AsyncIterable | Callable | Iterable | None = None
         self.input = source
 
@@ -67,7 +73,7 @@ class PersistenceLink(Link):
 
     async def run(self) -> None:
         self._reset_metrics()
-        async with self._store:
+        async with self._manager.store_context(self._store_id):
             from asyncio import TaskGroup
             try:
                 async with TaskGroup() as tg:
@@ -80,16 +86,13 @@ class PersistenceLink(Link):
         await self._emit_metrics()
 
     async def _process_loop(self) -> None:
-        write = getattr(self._store, self._operation)
         while True:
             datum = await self._queue.get()
             if isinstance(datum, EndOfStream):
                 await self.publish(END_OF_STREAM)
                 break
             try:
-                result = write(self._key_fn(datum), datum)
-                if isawaitable(result):
-                    await result
+                await self._write(self._key_fn(datum), datum)
             except Exception as e:
                 self._items_errored += 1
                 if self._on_error is not None:
@@ -99,3 +102,14 @@ class PersistenceLink(Link):
                 else:
                     raise
             await self.publish(datum)
+
+    async def _write(self, key: str, value: Any) -> None:
+        if self._operation == "upsert":
+            await self._manager.upsert(
+                self._store_id, key, value,
+                allow_inefficient=self._allow_inefficient,
+            )
+        elif self._operation == "create":
+            await self._manager.create(self._store_id, key, value)
+        else:  # update
+            await self._manager.update(self._store_id, key, value)

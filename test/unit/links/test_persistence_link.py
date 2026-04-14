@@ -1,14 +1,15 @@
 """
 Unit tests for PersistenceLink.
 
-PersistenceLink is a mid-chain tap: it writes each item to an async store
-(upsert by default), then passes the item through to downstream unchanged.
+PersistenceLink is a mid-chain tap: it writes each item to a named store
+via AsyncPersistenceManager (upsert by default), then passes the item through
+to downstream subscribers unchanged.
 
 Design contract:
-  - Calls store.upsert(key, item) for every item received
+  - Calls manager.upsert(store_id, key, item) for every item received
   - Passes every item downstream unchanged
   - key_fn extracts the store key from each item
-  - Manages store lifecycle via async with (start/flush/close)
+  - Manages store lifecycle via manager.store_context() (start/flush/close)
   - Does not write EOS to the store
   - Supports on_error: store errors handled without stopping the stream
   - Inherits Link behaviour: metrics, graceful shutdown
@@ -18,6 +19,7 @@ import unittest
 from collections.abc import Callable
 from typing import Any
 
+from oj_persistence.async_manager import AsyncPersistenceManager
 from oj_persistence.store.async_base import AsyncAbstractStore
 
 from io_chains.links.chain import Chain
@@ -25,8 +27,8 @@ from io_chains.links.collector import Collector
 from io_chains.links.persistence_link import PersistenceLink
 
 
-class InMemoryAsyncStore(AsyncAbstractStore):
-    """Minimal in-memory async store for testing."""
+class TrackingAsyncStore(AsyncAbstractStore):
+    """In-memory async store that tracks context-manager lifecycle."""
 
     def __init__(self):
         self._data: dict[str, Any] = {}
@@ -64,21 +66,48 @@ class InMemoryAsyncStore(AsyncAbstractStore):
         return [v for v in values if predicate(v)] if predicate else values
 
 
+def make_manager(store: AsyncAbstractStore, store_id: str = "s") -> AsyncPersistenceManager:
+    AsyncPersistenceManager._instance = None
+    pm = AsyncPersistenceManager()
+    pm.register(store_id, store)
+    return pm
+
+
 class TestPersistenceLinkInstantiation(unittest.TestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
     def test_instantiates(self):
-        store = InMemoryAsyncStore()
-        link = PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
+        link = PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))
         self.assertIsInstance(link, PersistenceLink)
+
+    def test_invalid_operation_raises(self):
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
+        with self.assertRaises(ValueError):
+            PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]), operation="replace")
 
 
 class TestPersistenceLinkPassthrough(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
     async def test_items_pass_through_to_downstream(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
         results = Collector()
 
         chain = Chain(
             source=[{"id": 1}, {"id": 2}, {"id": 3}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))],
             subscribers=[results],
         )
         await chain()
@@ -86,23 +115,25 @@ class TestPersistenceLinkPassthrough(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item async for item in results], [{"id": 1}, {"id": 2}, {"id": 3}])
 
     async def test_items_written_to_store(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
 
         chain = Chain(
             source=[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))],
         )
         await chain()
 
-        self.assertEqual(await store.read("1"), {"id": 1, "name": "Alice"})
-        self.assertEqual(await store.read("2"), {"id": 2, "name": "Bob"})
+        self.assertEqual(await pm.read("s", "1"), {"id": 1, "name": "Alice"})
+        self.assertEqual(await pm.read("s", "2"), {"id": 2, "name": "Bob"})
 
     async def test_eos_not_written_to_store(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
 
         chain = Chain(
             source=[{"id": 1}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))],
         )
         await chain()
 
@@ -110,12 +141,13 @@ class TestPersistenceLinkPassthrough(unittest.IsolatedAsyncioTestCase):
 
     async def test_passthrough_value_unchanged_by_store_write(self):
         """Store write is a side effect — original item reaches downstream."""
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
         results = Collector()
 
         chain = Chain(
             source=[{"id": 1, "val": 42}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))],
             subscribers=[results],
         )
         await chain()
@@ -124,33 +156,88 @@ class TestPersistenceLinkPassthrough(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPersistenceLinkLifecycle(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
     async def test_store_context_manager_entered_and_exited(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
 
         chain = Chain(
             source=[{"id": 1}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]))],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]))],
         )
         await chain()
 
         self.assertTrue(store.entered)
         self.assertTrue(store.exited)
 
+    async def test_unknown_store_id_raises_at_run_time(self):
+        pm = make_manager(TrackingAsyncStore(), store_id="other")
+        link = PersistenceLink(manager=pm, store_id="ghost", key_fn=lambda x: str(x["id"]))
+        chain = Chain(source=[{"id": 1}], links=[link])
+        with self.assertRaises(KeyError):
+            await chain()
+
+
+class TestPersistenceLinkOperations(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
+    async def test_create_operation(self):
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
+
+        chain = Chain(
+            source=[{"id": 1, "name": "Alice"}],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]), operation="create")],
+        )
+        await chain()
+
+        self.assertEqual(await pm.read("s", "1"), {"id": 1, "name": "Alice"})
+
+    async def test_update_operation(self):
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
+        await store.upsert("1", {"id": 1, "name": "Old"})
+
+        chain = Chain(
+            source=[{"id": 1, "name": "New"}],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]), operation="update")],
+        )
+        await chain()
+
+        self.assertEqual(await pm.read("s", "1"), {"id": 1, "name": "New"})
+
 
 class TestPersistenceLinkErrorHandling(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
     async def test_store_error_propagates_without_on_error(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
         await store.upsert("1", {"id": 1})  # pre-seed so create() raises
 
         chain = Chain(
             source=[{"id": 1}],
-            links=[PersistenceLink(store=store, key_fn=lambda x: str(x["id"]), operation="create")],
+            links=[PersistenceLink(manager=pm, store_id="s", key_fn=lambda x: str(x["id"]), operation="create")],
         )
         with self.assertRaises(KeyError):
             await chain()
 
     async def test_on_error_recovers_from_store_error(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
         await store.upsert("1", {"id": 1})  # pre-seed so create() raises on item 1
         errors = []
         results = Collector()
@@ -159,7 +246,8 @@ class TestPersistenceLinkErrorHandling(unittest.IsolatedAsyncioTestCase):
             source=[{"id": 1}, {"id": 2}],
             links=[
                 PersistenceLink(
-                    store=store,
+                    manager=pm,
+                    store_id="s",
                     key_fn=lambda x: str(x["id"]),
                     operation="create",
                     on_error=lambda e, item: errors.append(item),
@@ -173,19 +261,27 @@ class TestPersistenceLinkErrorHandling(unittest.IsolatedAsyncioTestCase):
         # both items still pass through
         self.assertEqual([item async for item in results], [{"id": 1}, {"id": 2}])
         # item 2 was written successfully
-        self.assertEqual(await store.read("2"), {"id": 2})
+        self.assertEqual(await pm.read("s", "2"), {"id": 2})
 
 
 class TestPersistenceLinkMetrics(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        AsyncPersistenceManager._instance = None
+
+    def tearDown(self):
+        AsyncPersistenceManager._instance = None
+
     async def test_metrics_tracked(self):
-        store = InMemoryAsyncStore()
+        store = TrackingAsyncStore()
+        pm = make_manager(store)
         captured = []
 
         chain = Chain(
             source=[{"id": 1}, {"id": 2}, {"id": 3}],
             links=[
                 PersistenceLink(
-                    store=store,
+                    manager=pm,
+                    store_id="s",
                     key_fn=lambda x: str(x["id"]),
                     on_metrics=lambda m: captured.append(m),
                 )

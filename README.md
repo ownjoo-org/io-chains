@@ -116,19 +116,25 @@ for item in results:
 
 ### `PersistenceLink`
 
-A mid-chain tap: writes each item to an `AsyncAbstractStore` (from `oj-persistence`), then passes the item through unchanged.
+A mid-chain tap: writes each item to a named store via `AsyncPersistenceManager` (from `oj-persistence`), then passes the item through unchanged.
 
-The store's async context manager is entered automatically at run start and exited on completion, guaranteeing any buffered writes are flushed.
+`store_context()` is entered at run start and exited on completion, guaranteeing any buffered writes (e.g. NDJSON) are flushed.
 
 ```python
+from oj_persistence.async_manager import AsyncPersistenceManager
 from oj_persistence.store.async_ndjson_file import AsyncNdjsonFileStore
 from io_chains import PersistenceLink
 
+manager = AsyncPersistenceManager()
+manager.register("records", AsyncNdjsonFileStore("data/output.ndjson"))
+
 PersistenceLink(
-    store=AsyncNdjsonFileStore("data/output.ndjson"),
+    manager=manager,
+    store_id="records",               # name registered with the manager
     key_fn=lambda item: str(item["id"]),  # extracts the store key from each item
-    operation="upsert",   # "upsert" (default) | "create" | "update"
-    on_error=None,        # callable(exc, item) — handle store errors without stopping the stream
+    operation="upsert",               # "upsert" (default) | "create" | "update"
+    allow_inefficient=False,          # passed through to manager.upsert()
+    on_error=None,                    # callable(exc, item) — handle store errors without stopping the stream
 )
 ```
 
@@ -260,8 +266,12 @@ await Chain(
 ### Persist items to disk mid-pipeline
 
 ```python
+from oj_persistence.async_manager import AsyncPersistenceManager
 from oj_persistence.store.async_ndjson_file import AsyncNdjsonFileStore
 from io_chains import Chain, Collector, PersistenceLink, Processor
+
+manager = AsyncPersistenceManager()
+manager.register("records", AsyncNdjsonFileStore("data/records.ndjson"))
 
 results = Collector()
 await Chain(
@@ -269,7 +279,8 @@ await Chain(
     links=[
         Processor(processor=normalize),
         PersistenceLink(
-            store=AsyncNdjsonFileStore("data/records.ndjson"),
+            manager=manager,
+            store_id="records",
             key_fn=lambda r: str(r["id"]),
         ),
     ],
