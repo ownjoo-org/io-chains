@@ -69,5 +69,68 @@ class TestPublisher(unittest.IsolatedAsyncioTestCase):
         await publisher.publish("anything")  # must not raise
 
 
+class TestPublisherOnMetricsProperty(unittest.TestCase):
+    def test_on_metrics_accepts_callable(self):
+        p = Publisher()
+        cb = lambda m: None
+        p.on_metrics = cb
+        self.assertIs(p.on_metrics, cb)
+
+    def test_on_metrics_accepts_none(self):
+        p = Publisher()
+        p.on_metrics = None
+        self.assertIsNone(p.on_metrics)
+
+    def test_on_metrics_rejects_non_callable(self):
+        p = Publisher()
+        with self.assertRaises(TypeError):
+            p.on_metrics = "not-callable"
+
+    def test_on_metrics_set_via_constructor(self):
+        cb = lambda m: None
+        p = Publisher(on_metrics=cb)
+        self.assertIs(p.on_metrics, cb)
+
+
+class TestPublisherMetrics(unittest.IsolatedAsyncioTestCase):
+    def test_subscriber_count_zero_with_no_subscribers(self):
+        publisher = Publisher()
+        self.assertEqual(publisher.subscriber_count, 0)
+
+    def test_subscriber_count_reflects_added_subscribers(self):
+        publisher = Publisher()
+        publisher.subscribers = [Collector(), Collector()]
+        self.assertEqual(publisher.subscriber_count, 2)
+
+    def test_subscriber_count_zero_after_close(self):
+        publisher = Publisher()
+        publisher.subscribers = [Collector()]
+        publisher.close()
+        self.assertEqual(publisher.subscriber_count, 0)
+
+    async def test_items_out_zero_before_publish(self):
+        publisher = Publisher()
+        self.assertEqual(publisher.items_out, 0)
+
+    async def test_items_out_counts_published_items(self):
+        publisher = Publisher()
+        publisher.subscribers = [Collector()]
+        await publisher.publish("a")
+        await publisher.publish("b")
+        self.assertEqual(publisher.items_out, 2)
+
+    async def test_items_out_excludes_eos(self):
+        publisher = Publisher()
+        publisher.subscribers = [Collector()]
+        await publisher.publish("a")
+        await publisher.publish(END_OF_STREAM)
+        self.assertEqual(publisher.items_out, 1)
+
+    async def test_items_out_counts_even_with_no_subscribers(self):
+        publisher = Publisher()
+        await publisher.publish("a")
+        self.assertEqual(publisher.items_out, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

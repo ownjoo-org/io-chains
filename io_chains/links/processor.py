@@ -25,9 +25,27 @@ class Processor(Link):
         self.input = source
 
         self._processor: Callable | None = processor
-        self._workers: int = max(1, workers)
-        self._active_workers: int = self._workers
-        self._batch_size: int = max(1, batch_size)
+        self._workers: int = 1
+        self._active_workers: int = 1
+        self._batch_size: int = 1
+        self.workers = workers
+        self.batch_size = batch_size
+
+    @property
+    def workers(self) -> int:
+        return self._workers
+
+    @workers.setter
+    def workers(self, value: int) -> None:
+        self._workers = max(1, value)
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    @batch_size.setter
+    def batch_size(self, value: int) -> None:
+        self._batch_size = max(1, value)
 
     def _eos_queue_count(self) -> int:
         return self._workers

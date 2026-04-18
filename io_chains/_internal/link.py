@@ -1,7 +1,8 @@
 import asyncio
 import time
+import tracemalloc
 from abc import abstractmethod
-from asyncio import Lock, Queue
+from asyncio import Queue
 from collections.abc import Callable
 from logging import getLogger
 from typing import Any
@@ -29,19 +30,48 @@ class Link(Linkable):
     def __init__(self, *args, queue_size: int = 0, on_error: Callable | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._queue: Queue = Queue(maxsize=queue_size)
-        self._on_error: Callable | None = on_error
+        self._on_error: Callable | None = None
         self._upstream_count: int = 0
         self._eos_received: int = 0
 
-        # Metrics counters — protected by the asyncio single-thread guarantee
-        # for items_in/items_skipped/items_errored; items_out uses a Lock because
-        # multiple workers may call publish() concurrently.
         self._items_in: int = 0
-        self._items_out: int = 0
         self._items_skipped: int = 0
         self._items_errored: int = 0
-        self._metrics_lock: Lock = Lock()
+        self._queue_depth_max: int = 0
+        self._mem_baseline: int = 0
         self._start_time: float = 0.0
+
+        self.on_error = on_error
+
+    @property
+    def on_error(self) -> Callable | None:
+        return self._on_error
+
+    @on_error.setter
+    def on_error(self, value: Callable | None) -> None:
+        if value is not None and not callable(value):
+            raise TypeError(f"on_error must be callable or None, got {type(value)}")
+        self._on_error = value
+
+    @property
+    def items_in(self) -> int:
+        return self._items_in
+
+    @property
+    def items_skipped(self) -> int:
+        return self._items_skipped
+
+    @property
+    def items_errored(self) -> int:
+        return self._items_errored
+
+    @property
+    def upstream_count(self) -> int:
+        return self._upstream_count
+
+    @property
+    def queue_depth_max(self) -> int:
+        return self._queue_depth_max
 
     def _register_upstream(self) -> None:
         self._upstream_count += 1
@@ -64,22 +94,22 @@ class Link(Linkable):
         else:
             self._items_in += 1
             await self._queue.put(datum)
-
-    async def publish(self, datum: Any) -> None:
-        if not isinstance(datum, EndOfStream):
-            async with self._metrics_lock:
-                self._items_out += 1
-        await super().publish(datum)
+            depth = self._queue.qsize()
+            if depth > self._queue_depth_max:
+                self._queue_depth_max = depth
 
     def _reset_metrics(self) -> None:
         self._items_in = 0
         self._items_out = 0
         self._items_skipped = 0
         self._items_errored = 0
+        self._queue_depth_max = 0
+        self._mem_baseline = tracemalloc.get_traced_memory()[1] if tracemalloc.is_tracing() else 0
         self._start_time = time.monotonic()
 
     async def _emit_metrics(self) -> None:
         elapsed = time.monotonic() - self._start_time
+        mem_peak = tracemalloc.get_traced_memory()[1] if tracemalloc.is_tracing() else 0
         metrics = LinkMetrics(
             name=self.name,
             items_in=self._items_in,
@@ -87,15 +117,28 @@ class Link(Linkable):
             items_skipped=self._items_skipped,
             items_errored=self._items_errored,
             elapsed_seconds=elapsed,
+            memory_peak_bytes=max(0, mem_peak - self._mem_baseline),
+            time_per_item_seconds=elapsed / self._items_in if self._items_in > 0 else 0.0,
+            subscribed_count=self._upstream_count,
+            subscriber_count=self.subscriber_count,
+            queue_depth_max=self._queue_depth_max,
+            throughput_items_per_sec=self.items_out / elapsed if elapsed > 0 else 0.0,
         )
         logger.info(
-            "link %r completed: in=%d out=%d skipped=%d errored=%d elapsed=%.4fs",
+            "link %r completed: in=%d out=%d skipped=%d errored=%d elapsed=%.4fs "
+            "mem=%dB per_item=%.6fs subscribed=%d subscribers=%d queue_max=%d tput=%.1f/s",
             self.name,
             metrics.items_in,
             metrics.items_out,
             metrics.items_skipped,
             metrics.items_errored,
             metrics.elapsed_seconds,
+            metrics.memory_peak_bytes,
+            metrics.time_per_item_seconds,
+            metrics.subscribed_count,
+            metrics.subscriber_count,
+            metrics.queue_depth_max,
+            metrics.throughput_items_per_sec,
             extra={
                 "link_name": self.name,
                 "items_in": metrics.items_in,
@@ -103,6 +146,12 @@ class Link(Linkable):
                 "items_skipped": metrics.items_skipped,
                 "items_errored": metrics.items_errored,
                 "elapsed_seconds": metrics.elapsed_seconds,
+                "memory_peak_bytes": metrics.memory_peak_bytes,
+                "time_per_item_seconds": metrics.time_per_item_seconds,
+                "subscribed_count": metrics.subscribed_count,
+                "subscriber_count": metrics.subscriber_count,
+                "queue_depth_max": metrics.queue_depth_max,
+                "throughput_items_per_sec": metrics.throughput_items_per_sec,
             },
         )
         if self._on_metrics is not None:

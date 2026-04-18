@@ -214,17 +214,24 @@ Processor(processor=lambda x: x if x > 0 else Skip)
 ### `LinkMetrics`
 
 Emitted once per `Processor` / `PersistenceLink` on completion via the `on_metrics=` callback.
+All fields are also readable as live properties on the link itself during a run.
 
-```python
-@dataclass
-class LinkMetrics:
-    name: str
-    items_in: int
-    items_out: int
-    items_skipped: int
-    items_errored: int
-    elapsed_seconds: float
-```
+| Field | Type | Description |
+|---|---|---|
+| `name` | `str` | Link name (from `name=` param) |
+| `items_in` | `int` | Items received (non-EOS) |
+| `items_out` | `int` | Items published downstream (non-EOS) |
+| `items_skipped` | `int` | Items dropped via `Skip` |
+| `items_errored` | `int` | Items that raised and were handled by `on_error` |
+| `elapsed_seconds` | `float` | Wall-clock time from run start to EOS |
+| `time_per_item_seconds` | `float` | `elapsed / items_in` (0.0 if no items) |
+| `throughput_items_per_sec` | `float` | `items_out / elapsed` |
+| `subscribed_count` | `int` | Number of upstream publishers feeding this link |
+| `subscriber_count` | `int` | Number of downstream subscribers |
+| `queue_depth_max` | `int` | Peak items buffered in the internal queue |
+| `memory_peak_bytes` | `int` | Peak bytes allocated during the run (requires `tracemalloc.start()` before the pipeline; 0 otherwise) |
+
+All counter and depth fields are also exposed as read-only properties directly on `Processor` / `Enricher` / `PersistenceLink` (e.g. `link.items_in`, `link.queue_depth_max`), so you can inspect live state mid-run without waiting for the `on_metrics` callback.
 
 ---
 
@@ -318,8 +325,15 @@ await Chain(source=[-0.156, 0.999, -0.301], links=[normalise, stringify], subscr
 ### Observability
 
 ```python
-def log_metrics(m):
-    print(f"{m.name}: {m.items_in} in, {m.items_out} out, {m.elapsed_seconds:.3f}s")
+def log_metrics(m: LinkMetrics) -> None:
+    print(
+        f"{m.name}: {m.items_in} in, {m.items_out} out, "
+        f"{m.items_skipped} skipped, {m.items_errored} errored | "
+        f"{m.elapsed_seconds:.3f}s total, {m.time_per_item_seconds*1000:.2f}ms/item, "
+        f"{m.throughput_items_per_sec:.0f} items/s | "
+        f"queue peak={m.queue_depth_max}, "
+        f"upstreams={m.subscribed_count}, downstreams={m.subscriber_count}"
+    )
 
 Processor(
     source=records,
@@ -327,6 +341,24 @@ Processor(
     name="transform-stage",
     on_metrics=log_metrics,
 )
+```
+
+To track memory allocation, start `tracemalloc` before running the pipeline:
+
+```python
+import tracemalloc
+tracemalloc.start()
+await chain()
+tracemalloc.stop()
+# m.memory_peak_bytes is now populated in the on_metrics callback
+```
+
+Live properties on the link itself are available mid-run (e.g. from a monitoring coroutine):
+
+```python
+processor = Processor(source=records, processor=transform, name="stage")
+# in a concurrent monitoring task:
+print(processor.items_in, processor.items_out, processor.queue_depth_max)
 ```
 
 ---

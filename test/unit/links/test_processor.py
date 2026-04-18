@@ -386,5 +386,45 @@ class TestProcessor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted([0, 3, 6, 9]), actual)
 
 
+class TestProcessorProperties(unittest.TestCase):
+    def test_workers_getter(self):
+        p = Processor(workers=3)
+        self.assertEqual(p.workers, 3)
+
+    def test_workers_setter_enforces_minimum_one(self):
+        p = Processor()
+        p.workers = 0
+        self.assertEqual(p.workers, 1)
+
+    def test_workers_setter_negative_enforces_minimum_one(self):
+        p = Processor()
+        p.workers = -5
+        self.assertEqual(p.workers, 1)
+
+    def test_workers_setter_valid(self):
+        p = Processor()
+        p.workers = 4
+        self.assertEqual(p.workers, 4)
+
+    def test_batch_size_getter(self):
+        p = Processor(batch_size=10)
+        self.assertEqual(p.batch_size, 10)
+
+    def test_batch_size_setter_enforces_minimum_one(self):
+        p = Processor()
+        p.batch_size = 0
+        self.assertEqual(p.batch_size, 1)
+
+    def test_batch_size_setter_negative_enforces_minimum_one(self):
+        p = Processor()
+        p.batch_size = -3
+        self.assertEqual(p.batch_size, 1)
+
+    def test_batch_size_setter_valid(self):
+        p = Processor()
+        p.batch_size = 5
+        self.assertEqual(p.batch_size, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
