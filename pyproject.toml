@@ -16,8 +16,11 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "httpx",
-    "oj-persistence",
+    "oj-persistence>=0.1.0",
 ]
+
+[project.optional-dependencies]
+dev = ["oj-toolkit", "pytest"]
 
 [project.urls]
 Repository = "https://github.com/ownjoo-org/io-chains"
