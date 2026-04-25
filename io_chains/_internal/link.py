@@ -31,6 +31,7 @@ class Link(Linkable):
         super().__init__(*args, **kwargs)
         self._queue: Queue = Queue(maxsize=queue_size)
         self._on_error: Callable | None = None
+        self._on_error_event: Callable | None = None
         self._upstream_count: int = 0
         self._eos_received: int = 0
 
@@ -52,6 +53,16 @@ class Link(Linkable):
         if value is not None and not callable(value):
             raise TypeError(f"on_error must be callable or None, got {type(value)}")
         self._on_error = value
+
+    @property
+    def on_error_event(self) -> Callable | None:
+        return self._on_error_event
+
+    @on_error_event.setter
+    def on_error_event(self, value: Callable | None) -> None:
+        if value is not None and not callable(value):
+            raise TypeError(f'on_error_event must be callable or None, got {type(value)}')
+        self._on_error_event = value
 
     @property
     def items_in(self) -> int:

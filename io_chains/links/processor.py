@@ -1,3 +1,4 @@
+import asyncio
 from asyncio import Lock, TaskGroup
 from collections.abc import AsyncGenerator, AsyncIterable, Callable, Iterable
 from inspect import isawaitable, isgenerator
@@ -5,7 +6,7 @@ from logging import getLogger
 from typing import Any
 
 from io_chains._internal.link import Link
-from io_chains._internal.sentinel import END_OF_STREAM, EndOfStream, Skip
+from io_chains._internal.sentinel import END_OF_STREAM, EndOfStream, ErrorEnvelope, Skip
 
 logger = getLogger(__name__)
 
@@ -18,6 +19,9 @@ class Processor(Link):
         processor: Callable | None = None,
         workers: int = 1,
         batch_size: int = 1,
+        max_retries: int = 0,
+        retry_delay: float = 0.0,
+        retry_backoff: float = 2.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -28,6 +32,9 @@ class Processor(Link):
         self._workers: int = 1
         self._active_workers: int = 1
         self._batch_size: int = 1
+        self._max_retries: int = max_retries
+        self._retry_delay: float = retry_delay
+        self._retry_backoff: float = retry_backoff
         self.workers = workers
         self.batch_size = batch_size
 
@@ -46,6 +53,30 @@ class Processor(Link):
     @batch_size.setter
     def batch_size(self, value: int) -> None:
         self._batch_size = max(1, value)
+
+    @property
+    def max_retries(self) -> int:
+        return self._max_retries
+
+    @max_retries.setter
+    def max_retries(self, value: int) -> None:
+        self._max_retries = max(0, value)
+
+    @property
+    def retry_delay(self) -> float:
+        return self._retry_delay
+
+    @retry_delay.setter
+    def retry_delay(self, value: float) -> None:
+        self._retry_delay = max(0.0, value)
+
+    @property
+    def retry_backoff(self) -> float:
+        return self._retry_backoff
+
+    @retry_backoff.setter
+    def retry_backoff(self, value: float) -> None:
+        self._retry_backoff = value
 
     def _eos_queue_count(self) -> int:
         return self._workers
@@ -75,11 +106,20 @@ class Processor(Link):
                     await self.push(datum)
             except Exception as e:
                 self._items_errored += 1
-                if self._on_error is not None:
+                # Fire observability hook
+                if self._on_error_event is not None:
+                    envelope = ErrorEnvelope(None, e, link_name=self.name, retry_count=0)
+                    evt_result = self._on_error_event(envelope)
+                    if isawaitable(evt_result):
+                        await evt_result
+                # Route to error_subscribers
+                envelope = ErrorEnvelope(None, e, link_name=self.name, retry_count=0)
+                if await self.publish_error(envelope):
+                    pass  # handled
+                elif self._on_error is not None:
                     result = self._on_error(e, None)
-                    if hasattr(result, "__await__"):
+                    if isawaitable(result):
                         result = await result
-                    # Skip or None → suppress; anything else → push to queue
                     if result is not None and not isinstance(result, Skip):
                         await self.push(result)
                 else:
@@ -98,40 +138,75 @@ class Processor(Link):
         return batch, False
 
     async def _process_and_publish(self, datum: Any) -> None:
-        """Process datum (or batch list) and publish result(s)."""
-        if self._processor:
+        """Process datum and publish result(s), with retry and error routing."""
+        if not self._processor:
+            if self._batch_size > 1 and isinstance(datum, list):
+                for item in datum:
+                    await self.publish(item)
+            else:
+                await self.publish(datum)
+            return
+
+        last_exc: Exception | None = None
+        result = None
+
+        for attempt in range(self._max_retries + 1):
             try:
                 result = self._processor(datum)
                 if isawaitable(result):
                     result = await result
+                last_exc = None
+                break
             except Exception as e:
+                last_exc = e
                 self._items_errored += 1
-                if self._on_error is not None:
-                    result = self._on_error(e, datum)
-                    if isawaitable(result):
-                        result = await result
-                else:
-                    raise
+                # Fire observability hook on every attempt failure
+                if self._on_error_event is not None:
+                    envelope = ErrorEnvelope(
+                        datum, e, link_name=self.name, retry_count=attempt
+                    )
+                    evt_result = self._on_error_event(envelope)
+                    if isawaitable(evt_result):
+                        await evt_result
+                if attempt < self._max_retries and self._retry_delay > 0:
+                    delay = self._retry_delay * (self._retry_backoff ** attempt)
+                    await asyncio.sleep(delay)
 
-            if isinstance(result, Skip):
-                self._items_skipped += 1
+        if last_exc is not None:
+            # Build final envelope (retry_count = total attempts made)
+            envelope = ErrorEnvelope(
+                datum, last_exc, link_name=self.name,
+                retry_count=self._max_retries,
+            )
+            # Route to error_subscribers if wired
+            if await self.publish_error(envelope):
                 return
-            elif isgenerator(result):
-                for item in result:
-                    await self.publish(item)
-                return
-            elif hasattr(result, "__aiter__"):
-                async for item in result:
-                    await self.publish(item)
-                return
-            datum = result
-        elif self._batch_size > 1 and isinstance(datum, list):
-            # No processor in batch mode: publish each item individually
-            for item in datum:
+            # Fall back to on_error callback (legacy simple handler)
+            if self._on_error is not None:
+                cb_result = self._on_error(last_exc, datum)
+                if isawaitable(cb_result):
+                    cb_result = await cb_result
+                if isinstance(cb_result, Skip):
+                    self._items_skipped += 1
+                    return
+                elif cb_result is not None:
+                    await self.publish(cb_result)
+                    return
+            raise last_exc
+
+        # Success path
+        if isinstance(result, Skip):
+            self._items_skipped += 1
+            return
+        elif isgenerator(result):
+            for item in result:
                 await self.publish(item)
             return
-
-        await self.publish(datum)
+        elif hasattr(result, '__aiter__'):
+            async for item in result:
+                await self.publish(item)
+            return
+        await self.publish(result)
 
     async def _handle_eos(self, lock: Lock) -> None:
         async with lock:

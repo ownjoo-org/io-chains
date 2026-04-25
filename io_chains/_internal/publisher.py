@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from asyncio import TaskGroup
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from io_chains._internal.sentinel import EndOfStream
 from io_chains._internal.subscriber import Subscriber
+
+if TYPE_CHECKING:
+    from io_chains._internal.sentinel import ErrorEnvelope
 
 
 class Publisher:
@@ -19,6 +24,7 @@ class Publisher:
         self.name: str = name
         self._on_metrics: Callable | None = None
         self._subscribers: list[Subscriber] = []
+        self._error_subscribers: list[Subscriber] = []
         self._items_out: int = 0
         self.on_metrics = on_metrics
         self.subscribers = subscribers
@@ -63,6 +69,24 @@ class Publisher:
         else:
             raise TypeError("subscribers must be a Subscriber or Iterable[Subscriber]")
 
+    @property
+    def error_subscribers(self) -> list['Subscriber']:
+        return self._error_subscribers
+
+    @error_subscribers.setter
+    def error_subscribers(self, subscribers: 'Subscriber | Iterable[Subscriber] | None') -> None:
+        if not subscribers:
+            return
+        if isinstance(subscribers, Subscriber):
+            self._error_subscribers.append(subscribers)
+        elif isinstance(subscribers, Iterable):
+            for s in subscribers:
+                if not isinstance(s, Subscriber):
+                    raise TypeError(f'each error_subscriber must be a Subscriber, got {type(s)}')
+                self._error_subscribers.append(s)
+        else:
+            raise TypeError('error_subscribers must be a Subscriber or Iterable[Subscriber]')
+
     def subscribe(self, subscriber: Subscriber, channel: str | None = None) -> None:
         """Wire a subscriber, optionally tagging each item with a channel label.
 
@@ -86,6 +110,24 @@ class Publisher:
         garbage-collected.  Safe to call multiple times.
         """
         self._subscribers.clear()
+        self._error_subscribers.clear()
+
+    async def publish_error(self, envelope: 'ErrorEnvelope') -> bool:
+        """Publish an ErrorEnvelope to error_subscribers.
+
+        Returns True if at least one error subscriber received it (handled),
+        False if no error subscribers are registered (caller should re-raise).
+        """
+        if not self._error_subscribers:
+            return False
+        envelope.handled = True
+        if len(self._error_subscribers) == 1:
+            await self._error_subscribers[0].push(envelope)
+        else:
+            async with TaskGroup() as tg:
+                for sub in self._error_subscribers:
+                    tg.create_task(sub.push(envelope))
+        return True
 
     async def publish(self, datum: Any) -> None:
         if not isinstance(datum, EndOfStream):
