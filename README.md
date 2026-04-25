@@ -33,7 +33,7 @@ To persist items to disk as they flow through the pipeline, use **`PersistenceLi
 ## Public API
 
 ```python
-from io_chains import Chain, Collector, Enricher, PersistenceLink, Processor, Relation, Skip, LinkMetrics
+from io_chains import Chain, Collector, Enricher, ErrorEnvelope, PersistenceLink, Processor, Relation, Skip, LinkMetrics
 ```
 
 ---
@@ -46,15 +46,51 @@ The core processing unit: source → transform → publish.
 
 ```python
 Processor(
-    source=...,        # list, iterable, async gen, or callable (optional)
-    processor=...,     # transform function — sync or async (optional)
-    subscribers=[...], # downstream subscribers (optional)
-    workers=1,         # number of concurrent workers
-    batch_size=1,      # items per worker call
-    on_error=None,     # callable(exc, item) — handle errors without stopping the stream
-    on_metrics=None,   # callable(LinkMetrics) — called once on completion
-    name="",           # label for metrics and logs
-    queue_size=0,      # internal queue depth (0 = unbounded)
+    source=...,         # list, iterable, async gen, or callable (optional)
+    processor=...,      # transform function — sync or async (optional)
+    subscribers=[...],  # downstream subscribers (optional)
+    workers=1,          # number of concurrent workers
+    batch_size=1,       # items per worker call
+    on_error=None,      # callable(exc, item) — handle errors without stopping the stream
+    on_metrics=None,    # callable(LinkMetrics) — called once on completion
+    name="",            # label for metrics and logs
+    queue_size=0,       # internal queue depth (0 = unbounded)
+    max_retries=0,      # retry failed items N times before giving up
+    retry_delay=0.0,    # initial delay in seconds between retries
+    retry_backoff=2.0,  # multiply delay by this factor after each attempt
+)
+```
+
+After construction, set the observability hook:
+
+```python
+processor.on_error_event = lambda envelope: ...  # called on every failed attempt
+```
+
+**Retry and error routing**
+
+When a `processor=` function raises:
+
+1. The attempt is retried up to `max_retries` times with exponential backoff (`retry_delay × retry_backoff^attempt`).
+2. On every failed attempt, `on_error_event(ErrorEnvelope)` fires — useful for surfacing errors to a monitoring layer without affecting routing.
+3. After all retries are exhausted:
+   - If `error_subscribers` are wired, an `ErrorEnvelope` is published to them (the item is considered handled).
+   - Otherwise, the legacy `on_error(exc, datum)` callback is called if set.
+   - If neither is set, the exception propagates and stops the pipeline.
+
+```python
+# Error edges (graph chains) — wire a recovery processor as an error subscriber
+rate_limiter = Processor(processor=handle_rate_limit)
+fetcher.error_subscribers = rate_limiter
+
+# Inline on_error — skip or recover without a dedicated link
+Processor(
+    source=records,
+    processor=transform,
+    max_retries=3,
+    retry_delay=1.0,
+    retry_backoff=2.0,
+    on_error=lambda exc, item: Skip(),   # drop after 3 retries
 )
 ```
 
@@ -196,6 +232,28 @@ await gather(
 | `attach_as` | `str` | Key added to the enriched primary item. |
 | `many` | `bool` | `True` → one-to-many (attach list); `False` → one-to-one (attach single or `None`). |
 | `key_transform` | callable or `None` | Optional transform applied to each key before lookup. |
+
+---
+
+### `ErrorEnvelope`
+
+Wraps an item that caused an exception during processing. Published to `error_subscribers` after all retries are exhausted, and passed to `on_error_event` on every failed attempt.
+
+| Attribute | Type | Description |
+|---|---|---|
+| `datum` | `Any` | The original item that caused the error |
+| `exc` | `Exception` | The exception raised |
+| `link_name` | `str` | Name of the link that failed |
+| `retry_count` | `int` | Number of attempts already made (0-based) |
+| `handled` | `bool` | Set to `True` by `Publisher.publish_error()` before routing |
+
+```python
+from io_chains import ErrorEnvelope
+
+def on_error(envelope: ErrorEnvelope):
+    print(f"[{envelope.link_name}] {type(envelope.exc).__name__} "
+          f"after {envelope.retry_count} retries — item: {envelope.datum!r}")
+```
 
 ---
 

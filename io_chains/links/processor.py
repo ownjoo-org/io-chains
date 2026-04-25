@@ -32,11 +32,14 @@ class Processor(Link):
         self._workers: int = 1
         self._active_workers: int = 1
         self._batch_size: int = 1
-        self._max_retries: int = max_retries
-        self._retry_delay: float = retry_delay
-        self._retry_backoff: float = retry_backoff
+        self._max_retries: int = 0
+        self._retry_delay: float = 0.0
+        self._retry_backoff: float = 2.0
         self.workers = workers
         self.batch_size = batch_size
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
 
     @property
     def workers(self) -> int:
