@@ -175,8 +175,9 @@ class TestProcessorRetry(unittest.IsolatedAsyncioTestCase):
 
 
 class TestOnErrorEvent(unittest.IsolatedAsyncioTestCase):
-    async def test_on_error_event_fires_on_each_failed_attempt(self):
-        """Hook is called for every attempt that raises, not just the last."""
+    async def test_on_error_event_fires_once_after_all_retries(self):
+        """Hook fires once after all retry attempts, with retry_count = max_retries
+        and the correct handled state (so callers know if an error edge caught it)."""
         events: list[ErrorEnvelope] = []
 
         def hook(env: ErrorEnvelope):
@@ -191,12 +192,11 @@ class TestOnErrorEvent(unittest.IsolatedAsyncioTestCase):
         p.on_error_event = hook
         await p()
 
-        # 3 attempts = 3 hook calls (attempt 0, 1, 2)
-        self.assertEqual(len(events), 3)
-        for i, ev in enumerate(events):
-            self.assertIsInstance(ev, ErrorEnvelope)
-            self.assertEqual(ev.retry_count, i)
-            self.assertEqual(ev.datum, 1)
+        # One event at the end, retry_count reflects max retries exhausted
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], ErrorEnvelope)
+        self.assertEqual(events[0].retry_count, 2)
+        self.assertEqual(events[0].datum, 1)
 
     async def test_on_error_event_fires_on_single_failure_no_retries(self):
         events: list[ErrorEnvelope] = []
@@ -230,6 +230,28 @@ class TestOnErrorEvent(unittest.IsolatedAsyncioTestCase):
         p.on_error_event = async_hook
         await p()
         self.assertEqual(len(events), 1)
+
+    async def test_on_error_event_reports_handled_true_when_error_edge_catches(self):
+        """When an error_subscriber handles the error, on_error_event fires with
+        handled=True so runners can distinguish dead-lettered errors from crashes."""
+        from io_chains._internal.subscriber import Subscriber
+        from io_chains._internal.sentinel import EndOfStream
+
+        events: list[ErrorEnvelope] = []
+
+        class _Sink(Subscriber):
+            """Swallows everything — simulates a dead_letter node."""
+            async def push(self, datum):
+                pass
+
+        p = Processor(source=[1], processor=lambda x: 1 / 0)
+        p.on_error_event = lambda env: events.append(env)
+        p._error_subscribers.append(_Sink())
+
+        await p()
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].handled, 'expected handled=True when error_subscriber caught the error')
 
     async def test_on_error_event_does_not_suppress_exception(self):
         """Hook fires, but exception still propagates when no on_error is set."""

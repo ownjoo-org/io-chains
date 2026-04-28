@@ -109,16 +109,14 @@ class Processor(Link):
                     await self.push(datum)
             except Exception as e:
                 self._items_errored += 1
-                # Fire observability hook
+                envelope = ErrorEnvelope(None, e, link_name=self.name, retry_count=0)
+                handled = await self.publish_error(envelope)
                 if self._on_error_event is not None:
-                    envelope = ErrorEnvelope(None, e, link_name=self.name, retry_count=0)
                     evt_result = self._on_error_event(envelope)
                     if isawaitable(evt_result):
                         await evt_result
-                # Route to error_subscribers
-                envelope = ErrorEnvelope(None, e, link_name=self.name, retry_count=0)
-                if await self.publish_error(envelope):
-                    pass  # handled
+                if handled:
+                    pass
                 elif self._on_error is not None:
                     result = self._on_error(e, None)
                     if isawaitable(result):
@@ -163,26 +161,26 @@ class Processor(Link):
             except Exception as e:
                 last_exc = e
                 self._items_errored += 1
-                # Fire observability hook on every attempt failure
-                if self._on_error_event is not None:
-                    envelope = ErrorEnvelope(
-                        datum, e, link_name=self.name, retry_count=attempt
-                    )
-                    evt_result = self._on_error_event(envelope)
-                    if isawaitable(evt_result):
-                        await evt_result
                 if attempt < self._max_retries and self._retry_delay > 0:
                     delay = self._retry_delay * (self._retry_backoff ** attempt)
                     await asyncio.sleep(delay)
 
         if last_exc is not None:
-            # Build final envelope (retry_count = total attempts made)
+            # Build final envelope (retry_count = total attempts made).
+            # publish_error sets envelope.handled = True before pushing to
+            # error_subscribers, so on_error_event fires AFTER with the
+            # correct handled state.
             envelope = ErrorEnvelope(
                 datum, last_exc, link_name=self.name,
                 retry_count=self._max_retries,
             )
             # Route to error_subscribers if wired
-            if await self.publish_error(envelope):
+            handled = await self.publish_error(envelope)
+            if self._on_error_event is not None:
+                evt_result = self._on_error_event(envelope)
+                if isawaitable(evt_result):
+                    await evt_result
+            if handled:
                 return
             # Fall back to on_error callback (legacy simple handler)
             if self._on_error is not None:

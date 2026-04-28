@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oj-io-chains"
-version = "0.1.1"
+version = "0.1.2"
 description = "Lightweight async data pipelines using a publisher/subscriber pattern"
 readme = "README.md"
 license = "MIT"
